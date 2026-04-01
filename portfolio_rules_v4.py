@@ -1,0 +1,788 @@
+
+
+
+from __future__ import annotations
+import asyncio
+import re
+from typing import Any, Optional, Sequence, Dict, Tuple
+
+import polars as pl
+from app.helpers.polars_hyper_plugin import *
+
+from app.logs.logging import log
+from app.helpers.common import PACT_USERNAMES
+from app.services.payload.payloadV4 import Delta, Publish, RoomContext, INDEX_COL_NAME, User
+from app.helpers.type_helpers import ensure_list
+from app.services.redux.grid_system_v4 import rule, RuleDef, RuleDependency, Priority, EmitMode, DepMode, RulesEngine, RuleContext
+from app.helpers.date_helpers import isonow
+from app.services.rules.desigMatchV2 import desigNameFuzzyMatchRule
+from app.helpers.regex_helpers import hyper_match
+from app.services.loaders.kdb_queries_dev_v2 import *
+
+# --------------------------------- Helper Functions --------------------------------
+
+# --------------------------------- Constants ------------------------------------------
+
+NEW_LEVEL_COLS = ("newLevelPx", "newLevelSpd", "newLevelYld", "newLevelMmy", "newLevelDm")
+SKEW_COLS = ("relativeSkewValue", "skewType")
+
+STATE_TO_ISREAL = {
+    "TEST": 0, "ERROR": 0, "CANCELLED": 0, "DNT": 0, "INDICATIVE": 0, "TRANSFER": 0
+}
+DEFAULT_ISREAL = 1
+
+AUDIT_USER_KEYS = ("user", "userName", "username", "displayName")
+AUDIT_FP_KEYS = ("fingerprint", "fp", "client_fp")
+AUDIT_TS_KEYS = ("client_ts", "ts", "timestamp_ms")
+
+MARKET_COL_REGEX = re.compile(r"^([a-z]+)(Bid|Mid|Ask)(Px|Spd|Yld|Mmy|Dm|Ytm|Ytw|Ytc)$")
+
+QT_TO_NEWLEVEL: Dict[str, str] = {
+    "PX": "newLevelPx",
+    "SPD": "newLevelSpd",
+    "YLD": "newLevelYld",
+    "MMY": "newLevelMmy",
+    "DM": "newLevelDm",
+    "YTM": "newLevelYtm",
+    "YTW": "newLevelYtw",
+    "YTC": "newLevelYtc",
+}
+
+CLEAR_RESETS_SKEW = True
+
+# --------------------------------- Tiny helpers ---------------------------------------
+
+def build_streaming_s3_rule(
+        fields: Optional[Sequence[str]] = None,
+        timeout: float = 31,
+        max_retries: int = 3,
+        retry_delay: float = 0.25,
+        retry_jitter: float = 0.05,
+        backoff: float = 1.0,
+        stream=False,
+) -> "RuleDef":
+    @rule(
+        name="s3_enrichment_stream",
+        column_triggers_any=list(NEW_LEVEL_COLS) + [
+            'tradeToConvention',
+            'benchmarkIsin',
+            "benchmarkBidYld",
+            "benchmarkBidPx",
+        ],
+        priority=Priority.HIGH,
+        emit_mode=EmitMode.IMMEDIATE,
+        declared_column_outputs=NEW_LEVEL_COLS
+    )
+    async def _s3_stream(ctx):
+        return
+        s3_cols = [
+            "isin", "quoteType", "conventionQuoteType",
+            "tradeToConvention", "settleDate", "tnum",
+            "benchmarkIsin", "benchmarkBidYld", "benchmarkBidPx",
+        ]
+        df_delta = await ctx.running_delta_slice(columns=s3_cols)
+        if df_delta is None or df_delta.hyper.is_empty(): return
+
+        portfolio_key = df_delta.hyper.peek("portfolioKey")
+        market_cols = df_delta.hyper.cols_like("newLevel(Px|Spd|Yld|Mmy|Dm)$")
+
+        if df_delta.filter([pl.col(tm).is_not_null() for tm in market_cols]).hyper.is_empty(): return
+
+        from app.server import get_s3
+        s3 = get_s3()
+
+        all_payloads = []
+        payloads = await s3.pt_to_s3_payloads(df_delta, market_cols=market_cols, contextFields=["tnum"])
+        if not payloads: return
+
+        s3_chunk = await s3.stream_query_retry_failed(
+            payloads,
+            timeout=timeout,
+            max_retries=max_retries,
+            delay=retry_delay,
+            jitter=retry_jitter,
+            backoff=backoff,
+            raw=False,
+            stream=False,
+        )
+        if s3_chunk is None or s3_chunk.hyper.is_empty(): return
+
+        out_df = s3_chunk.with_columns([
+            pl.col("s3Context").cast(pl.String, strict=False).alias("tnum"),
+            pl.lit(portfolio_key, pl.String).alias("portfolioKey"),
+        ])
+        oc = out_df.hyper.schema()
+        of = oc.keys()
+        out_df = out_df.rename({x: x.replace("Bid", "").replace("Ask", "") for x in of if "newLevel" in x})
+
+        if all([x in oc for x in ['newLevelBenchYld', 'newLevelYld', 'newLevelSpd']]):
+            out_df = out_df.join(df_delta.select(["tnum", "quoteType"]), on="tnum", how="left")
+            out_df = out_df.with_columns([
+                pl.when(pl.col("newLevelSpd").is_null() & pl.col("newLevelBenchYld").is_not_null() & pl.col("newLevelYld").is_not_null())
+                .then(
+                    (
+                            pl.col("newLevelYld").cast(pl.Float64, strict=False) -
+                            pl.col("newLevelBenchYld").cast(pl.Float64, strict=False)
+                    ) * 100
+                ).otherwise(pl.col("newLevelSpd"))
+                .alias("newLevelSpd")
+            ])
+
+        return out_df
+
+    return _s3_stream
+
+
+def _parse_market_col(col: str) -> Optional[Tuple[str, str, str]]:
+    m = MARKET_COL_REGEX.match(col or "")
+    if not m:
+        return None
+    market, side, qt = m.group(1), m.group(2), m.group(3)
+    return market.upper(), side, qt.upper()
+
+
+def _build_impacted_updates_for_col(ctx, col: str, j) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
+    spec = _parse_market_col(col)
+    if spec is None:
+        return None, None
+
+    market_u, side, qt_u = spec
+    target_newlevel = QT_TO_NEWLEVEL.get(qt_u)
+    if not target_newlevel:
+        return None, None
+
+    pk_cols = list(ctx.target_pks)
+
+    is_target = (
+            (pl.col("skewType") == 1) &
+            (pl.col("relativeSkewTargetMkt").str.to_uppercase() == pl.lit(market_u)) &
+            (pl.col("relativeSkewTargetSide") == pl.lit(side)) &
+            (pl.col("relativeSkewTargetQuoteType").str.to_uppercase() == pl.lit(qt_u))
+    )
+
+    has_source = is_target & pl.col(col).is_not_null() & pl.col("relativeSkewValue").is_not_null()
+    upd = j.filter(has_source)
+
+    updates_df = None
+    if not upd.is_empty():
+        updates_df = upd.select(
+            pk_cols + [
+                (pl.col(col) + pl.col("relativeSkewValue")).alias(target_newlevel),
+                (pl.col(col) + pl.col("relativeSkewValue")).alias("newLevel")
+            ]
+        )
+
+    clears_df = None
+    if CLEAR_RESETS_SKEW:
+        to_clear = j.filter(is_target & pl.col(col).is_null())
+        if not to_clear.is_empty():
+            clears_df = to_clear.select(pk_cols).with_columns([
+                pl.lit(None, dtype=pl.Float64).alias(target_newlevel),
+                pl.lit(0, dtype=pl.Int8).alias("skewType"),
+                pl.lit(None, dtype=pl.Utf8).alias("relativeSkewTargetMkt"),
+                pl.lit(None, dtype=pl.Utf8).alias("relativeSkewTargetSide"),
+                pl.lit(None, dtype=pl.Utf8).alias("relativeSkewTargetQuoteType"),
+                pl.lit(None, dtype=pl.Float64).alias("relativeSkewValue"),
+            ])
+
+    return updates_df, clears_df
+
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+# FUZZY DESIG/ASSIGNED: Auto swaps an entered name for a cleanly formatted, full name.
+# "~" overrides this behavior, entered information becomes the value (minus the tilda)
+# "REMOVE", "x", etc. set as REMOVED which triggers 0 size
+# Fast path check against common names where phonebook might fail
+# Checks against names currently in the basket
+# Checks against the phonebook
+# Factors in tickers and name occurances into guesses
+
+@rule(
+    name="fuzzy_desig",
+    room_pattern="*.PORTFOLIO",
+    column_triggers_any=("desigName", ),
+    priority=Priority.MEDIUM,
+    emit_mode=EmitMode.IMMEDIATE,
+    suppress_cascade=True,
+    declared_column_outputs=("desigName", "assignedTrader"),
+)
+async def fuzzy_desig(ctx):
+    try:
+        from app.server import get_pbf
+        fuzzy_matcher = await get_pbf()
+    except Exception as e:
+        await log.error(f"Fuzzy Match Rule failed to initialize with phone book: {e}")
+        fuzzy_matcher = desigNameFuzzyMatchRule(None)
+    res = await fuzzy_matcher.execute_fuzzy_match(ctx, base_field="desigName")
+    return res
+
+@rule(
+    name="fuzzy_assigned",
+    room_pattern="*.PORTFOLIO",
+    column_triggers_any=("assignedTrader", ),
+    priority=Priority.HIGH,
+    emit_mode=EmitMode.IMMEDIATE,
+    suppress_cascade=True,
+    declared_column_outputs=("desigName", "assignedTrader"),
+)
+async def fuzzy_assigned(ctx):
+    try:
+        from app.server import get_pbf
+        fuzzy_matcher = await get_pbf()
+    except Exception as e:
+        await log.error(f"Fuzzy Match Rule failed to initialize with phone book: {e}")
+        fuzzy_matcher = desigNameFuzzyMatchRule(None)
+    return await fuzzy_matcher.execute_fuzzy_match(ctx, base_field="assignedTrader")
+
+
+# REMOVED_BOND: Sets the size to be 0 and the isReal flag to be false.
+# Or, alternatively, re-sets the size as the originalSize and sets the isReal flag to true.
+
+@rule(
+    name="removed_bond",
+    room_pattern="*.PORTFOLIO",
+    priority=Priority.HIGH,
+    emit_mode=EmitMode.IMMEDIATE,
+    depends_on_any=(
+            RuleDependency("fuzzy_desig", DepMode.FINISHED),
+            RuleDependency("fuzzy_assigned", DepMode.FINISHED),
+    ),
+    declared_column_outputs=("grossSize", "isReal"),
+)
+async def removed_bond(ctx: RuleContext):
+    slice = await ctx.running_delta_slice(columns=['assignedTrader', 'desigName'])
+    prior = await ctx.prior_delta_slice(columns=['assignedTrader', 'desigName', 'originalSize'])
+    data = slice.join(prior, on=['tnum', 'portfolioKey'], how='left', suffix='_old')
+
+    removed = data.filter([
+        (pl.col('desigName').cast(pl.String, strict=False) == 'REMOVED') |
+        (pl.col('assignedTrader').cast(pl.String, strict=False) == 'REMOVED'),
+        (pl.col('desigName_old').cast(pl.String, strict=False) != 'REMOVED') |
+        (pl.col('assignedTrader_old').cast(pl.String, strict=False) != 'REMOVED')
+    ]).with_columns([
+        pl.lit(0, pl.Float64).alias('grossSize'),
+        pl.lit(0, pl.Int8).alias('isReal')
+    ])
+
+    added = data.filter([
+        (pl.col('desigName').cast(pl.String, strict=False) != 'REMOVED') |
+        (pl.col('assignedTrader').cast(pl.String, strict=False) != 'REMOVED'),
+        (pl.col('desigName_old').cast(pl.String, strict=False) == 'REMOVED') |
+        (pl.col('assignedTrader_old').cast(pl.String, strict=False) == 'REMOVED')
+    ]).with_columns([
+        pl.col('originalSize').alias('grossSize'),
+        pl.lit(1, pl.Int8).alias('isReal')
+    ])
+
+    return pl.concat([added, removed], how='vertical').select(['tnum', 'portfolioKey', 'grossSize', 'isReal'])
+
+
+# RISK_ADJUST: Keeps risk metrics in line with any changes in size
+# Note that notional amendments -> trigger dv01 adjustments but not the other way around
+# This is intentional to allow for DV01 corrections whereas the Notional is provided from the client
+@rule(
+    name="risk_adjust",
+    column_triggers_any=("grossSize", "unitAccrued", "unitDv01"),
+    room_pattern="*.PORTFOLIO",
+    target_grid_id="portfolio",
+    priority=Priority.MEDIUM,
+    emit_mode=EmitMode.IMMEDIATE,
+    declared_column_outputs=("grossSize", "grossDv01", 'accruedInterest'),
+)
+async def risk_adjust(ctx):
+    """When we adjust the size, adjust the dv01 as well."""
+    from app.services.loaders.kdb_queries_dev_v2 import risk_transforms
+    data = (await ctx.running_delta_slice(['tnum', 'isin', 'portfolioKey'] + ['unitDv01','unitAccrued','unitCs01','unitCs01Pct','grossSize','axeFullBidSize','axeFullAskSize','netFirmPosition','netAlgoPosition','netStrategyPosition','netDeskPosition','signalFlag','side']))
+    res = await risk_transforms(data)
+    return res.join(data.select('tnum', 'portfolioKey').lazy(), on='tnum', how='inner')
+
+
+
+
+
+
+@rule(
+    name="edit_audit",
+    column_triggers_any=tuple(NEW_LEVEL_COLS) + SKEW_COLS,
+    depends_on_all=(
+            RuleDependency("new_level_expand", DepMode.FINISHED),
+            # RuleDependency("clear_levels", DepMode.FINISHED),
+            # RuleDependency("s3_enrichment_stream", DepMode.FINISHED),
+    ),
+    room_pattern="*.PORTFOLIO",
+    priority=Priority.AUDIT,
+    emit_mode=EmitMode.END,
+    declared_column_outputs=("lastEditUser", "lastEditTime"),
+)
+async def edit_audit(ctx):
+    """Record who made the edit and when."""
+    try:
+        user_data = ctx.ingress_user
+        username = user_data.username
+        name = user_data.displayName
+
+        if (name is None) or (str(name).upper()=="SERVER"): return
+
+
+        delta = await ctx.running_delta_slice(['newLevel', 'lastAdminEditNewLevel', 'lastTraderEditNewLevel', 'desigName'])
+        if not isinstance(user_data, User):
+            await log.error(f"Wrong user_data type: {type(user_data)}")
+            return
+
+        ts = isonow(True)
+        exprs = [pl.lit(ts).alias("lastEditTime")]
+
+        if not user_data.impersonateMode:
+            my_name = pl.lit(name, pl.String)
+            exprs.append(my_name.alias("lastEditUser"))
+        else:
+            my_name = pl.col('desigName')
+            exprs.append(my_name.alias("lastEditUser"))
+            exprs.append(pl.lit('IMPERSONATE', pl.String).alias('lastEditSource'))
+
+        pk_cols = ['portfolioKey', 'tnum']
+        cols = pk_cols + ['newLevel', 'desigName']
+
+        if (username in PACT_USERNAMES) and (not user_data.impersonateMode):
+            exprs.extend([
+                my_name.alias("lastAdminEditUser"),
+                pl.lit(ts).alias("lastAdminEditTimestamp"),
+                pl.when(pl.col('newLevel').is_not_null())
+                    .then(pl.col('newLevel'))
+                    .otherwise(pl.col('lastAdminEditNewLevel'))
+                .alias('lastAdminEditNewLevel')
+            ])
+            cols.extend(['lastAdminEditNewLevel'])
+            if not user_data.impersonateMode:
+                exprs.append(pl.lit('ADMIN').alias('lastEditSource'))
+        else:
+            exprs.extend([
+                my_name.alias("lastTraderEditUser"),
+                pl.lit(ts).alias("lastTraderEditTimestamp"),
+                pl.when(pl.col('newLevel').is_not_null())
+                    .then(pl.col('newLevel'))
+                    .otherwise(pl.col('lastTraderEditNewLevel'))
+                .alias('lastTraderEditNewLevel')
+            ])
+            cols.extend(['lastTraderEditNewLevel'])
+            if not user_data.impersonateMode:
+                exprs.append(pl.lit('TRADER').alias('lastEditSource'))
+
+        if exprs:
+            res = delta.select(cols).with_columns(exprs).drop(['newLevel', 'desigName'], strict=False)
+            return res
+    except Exception as e:
+        await log.error(f"audit error: {e}")
+        return None
+
+
+@rule(
+    name="new_level_expand",
+    column_triggers_any=NEW_LEVEL_COLS,
+    depends_on_all=(RuleDependency("s3_enrichment_stream", DepMode.FINISHED),),
+    priority=Priority.CRITICAL,
+    emit_mode=EmitMode.IMMEDIATE,
+)
+async def new_level_expand(ctx):
+    try:
+        all_mkts = ["newLevelPx", "newLevelSpd", "newLevelYld", "newLevelMmy", "newLevelDm"]
+        changes = (await ctx.running_delta_slice(columns=(all_mkts + ["quoteType", "newLevel"]))).with_columns(
+            pl.col("quoteType").replace_strict(QT_TO_NEWLEVEL, return_dtype=pl.String).alias("_qtMap"),
+            pl.col("newLevel").alias("_newLevel"),
+        )
+        c = list(set(ensure_list(ctx.target_pks) + ["newLevel"]))
+        result = changes.with_columns([
+            pl.coalesce([
+                pl.when(pl.col("_qtMap") == col).then(pl.col(col)).otherwise(pl.lit(None, pl.Float64))
+                for col in all_mkts
+            ]).alias("newLevel")
+        ])
+        return result.select(c)
+    except Exception as e:
+        await log.error("New level expand:", e=str(e))
+        return None
+
+
+@rule(
+    name="trader_claim",
+    column_triggers_any=("claimed",),
+    priority=Priority.MEDIUM,
+    emit_mode=EmitMode.END,
+    declared_column_outputs=("assignedTrader",),
+)
+async def trader_claim(ctx):
+    """Handle trader claiming a bond."""
+    try:
+        pks = list(ctx.target_pks)
+
+        prior = await ctx.price_delta_slice(columns=["algoAssigned", "whichAlgo", "desigName", "desigTraderId"])
+        delta = await ctx.running_delta_slice(columns=["algoAssigned", "whichAlgo", "desigTraderId"])
+        new_delta = delta.join(prior, on=ctx.target_pks, how="left", suffix="_prior")
+
+        user_data = getattr(ctx.state, "user_data", {})
+        return new_delta.with_columns([
+            pl.col("claimed").cast(pl.Int8, strict=False)
+        ]).with_columns([
+            pl.when(pl.col("claimed") == 2)
+            .then(pl.lit(user_data.get("displayName", "UNKNOWN")))
+            .when(pl.col("claimed") == 1).then(pl.col("desigName"))
+            .otherwise(
+                pl.when(pl.col("algoAssigned").cast(pl.Boolean, strict=False))
+                .then(pl.concat_str(pl.col("whichAlgo"), pl.lit("ALGO"), separator=" "))
+                .otherwise(pl.col("desigName"))
+            ).cast(pl.String, strict=False).alias("assignedTrader"),
+        ]).with_columns([
+            pl.when(pl.col("desigName").is_null() & pl.col("assignedTrader").is_not_null() & (pl.col("claimed") > 0))
+            .then(pl.col("assignedTrader")).otherwise(pl.col("desigName")).alias("desigName")
+        ]).select(["assignedTrader", "desigName", "tnum", "portfolioKey"])
+    except Exception as e:
+        await log.error("trader claim:", e=str(e))
+        return None
+
+
+@rule(
+    name="refresh_all_markets",
+    column_triggers_any=("refSyncTime",),
+    room_pattern="*.PORTFOLIO",
+    priority=Priority.MEDIUM,
+    emit_mode=EmitMode.END,
+)
+async def refresh_all_markets(ctx):
+    """Trigger market refresh from KDB."""
+    from app.services.loaders.kdb_queries_dev import get_all_quotes
+    from app.services.loaders.kdb_queries_dev import coalesce_left_join
+
+    pk_cols = set(ctx.target_pks or [])
+    if not pk_cols:
+        await log.warning("[refresh_markets] grid missing PKs; skipping")
+        return None
+
+    try:
+        target = ctx.prior_delta_slice(columns=["isin", "cusip", "sym", "portfolioKey", "tnum"])
+        try:
+            quotes = await get_all_quotes(target.lazy())
+            quotes = await coalesce_left_join(target.lazy(), quotes.lazy(), on="isin")
+            quotes = quotes.drop(["cusip", "sym"], strict=False)
+        except Exception as e:
+            await log.error(f"[refresh_markets] quotes fetch failed: {e}")
+            return None
+
+        if (quotes is None) or quotes.hyper.is_empty():
+            await log.error("[refresh_markets] quotes fetch empty")
+            return None
+
+        return quotes
+    except Exception as e:
+        await log.error(f"[refresh_markets] unexpected error: {e}")
+        return None
+
+
+@rule(
+    name="state_check",
+    column_triggers_any=("state",),
+    room_pattern="*.META",
+    priority=Priority.LOW,
+    emit_mode=EmitMode.END,
+    declared_column_outputs=("isReal",),
+)
+async def state_check(ctx):
+    """If state is in TEST, ERROR, etc. set isReal to False."""
+    try:
+        FAKE_KEYS = list(STATE_TO_ISREAL.keys())
+        return (await ctx.running_delta_slice(columns=["isReal", "bsrPct", "numDealers"])).with_columns([
+            pl.col("state").cast(pl.String, strict=False).str.to_uppercase().alias("state"),
+        ]).with_columns([
+            pl.when(pl.col("state").is_in(FAKE_KEYS))
+            .then(pl.lit(0, pl.Int8))
+            .otherwise(pl.lit(1, pl.Int8))
+            .alias("isReal"),
+        ]).select(["date", "portfolioKey", "isReal"])
+    except Exception as e:
+        await log.error("state check:", e=str(e))
+        return None
+
+@rule(
+    name="rank_update",
+    column_triggers_any=("state",),
+    room_pattern="*.META",
+    priority=Priority.LOW,
+    emit_mode=EmitMode.END,
+    declared_column_outputs=("barcRank",),
+)
+async def rank_update(ctx):
+    try:
+        return (await ctx.running_delta_slice(columns=["barcRank", "numDealers"])).with_columns([
+            pl.col("state").cast(pl.String, strict=False).str.to_uppercase().alias("state"),
+        ]).with_columns([
+            pl.when(pl.col('barcRank').is_null()).then(
+                pl.when(pl.col("state") == 'WON').then(pl.lit(1, pl.Int64))
+                .when(pl.col('state') == 'COVERED').then(pl.lit(2, pl.Int64))
+                .when(pl.col('numDealers').is_not_null() & (pl.col('numDealers') == 3) & (pl.col('state')=='MISSED')).then(pl.lit(3, pl.Int64))
+                .otherwise(pl.lit(None, pl.Int64))
+            ).otherwise(pl.col('barcRank')).alias("barcRank"),
+        ]).select(["date", "portfolioKey", "barcRank"])
+    except Exception as e:
+        await log.error("state check:", e=str(e))
+        return None
+
+
+@rule(
+    name="test_in_name",
+    column_triggers_any=("client",),
+    room_pattern="*.META",
+    priority=Priority.LOW,
+    emit_mode=EmitMode.END,
+    declared_column_outputs=("isReal", "state"),
+)
+async def test_in_name(ctx):
+    """If 'test' in client name, set state to TEST."""
+    delta = await ctx.running_delta_slice()
+    if (delta is None) or (not delta.hyper.is_empty()): return
+    d = delta.hyper.peek(["client", 'portfolioKey', 'date'])
+    client, portfolioKey, portfolioDate = d.get('client'), d.get('portfolioKey'), d.get('date')
+    if client and hyper_match(r"(?i)\btest\b|\btest(?=\w)", client, case_sensitive=False):
+        return pl.DataFrame([{"portfolioKey": portfolioKey, "date": portfolioDate, "state": "TEST"}])
+
+
+@rule(
+    name="meta_update",
+    depends_on_all=(
+            RuleDependency("new_level_expand", DepMode.FINISHED),
+            RuleDependency("clear_levels", DepMode.FINISHED),
+            RuleDependency("s3_enrichment_stream", DepMode.FINISHED),
+    ),
+    column_triggers_all=("newLevel",),
+    room_pattern="*.PORTFOLIO",
+    target_grid_id="meta",
+    target_primary_keys=("portfolioKey", "date"),
+    priority=Priority.LOW,
+    emit_mode=EmitMode.END,
+    declared_column_outputs=("pctPriced",),
+)
+async def meta_update(ctx):
+    """Update pct priced on meta grid."""
+    try:
+
+        new_basket = await ctx.running_frame_slice(['newLevel', 'rfqCreateDate'])
+        delta = new_basket.filter([pl.col("newLevel").is_not_null()])
+        delta_height = delta.hyper.height() or 0
+        total = new_basket.hyper.height()
+
+        key = new_basket.hyper.peek("portfolioKey")
+        date = new_basket.hyper.peek("rfqCreateDate")
+
+        if total > 0:
+            priced_pct = round(delta_height / total, 4)
+            return Delta(
+                frame=pl.DataFrame([{"portfolioKey": key, "date": date, "pctPriced":priced_pct}]),
+                pk_columns=["portfolioKey", "date"],
+                changed_columns=["pctPriced"],
+                mode="update",
+            )
+        else:
+            await log.error("new_basket height is 0:", new_basket)
+            return None
+    except Exception as e:
+        await log.error("meta update", e=str(e))
+        return None
+
+
+@rule(
+    name="market_propegate",
+    room_pattern="*.PORTFOLIO",
+    priority=Priority.HIGH,
+    emit_mode=EmitMode.IMMEDIATE,
+    declared_column_outputs=tuple(QT_TO_NEWLEVEL.values()) + (
+            "skewType", "relativeSkewTargetMkt", "relativeSkewTargetSide",
+            "relativeSkewTargetQuoteType", "relativeSkewValue",
+    ),
+)
+async def market_propegate(ctx):
+    """When reference markets update, update dependent skews."""
+    slice = await ctx.running_delta_slice()
+    market_cols = [c for c in slice.columns if MARKET_COL_REGEX.match(str(c))]
+    if not market_cols:
+        return None
+
+    updates, clears = [], []
+
+    need_cols = [
+        "skewType", "relativeSkewTargetMkt", "relativeSkewTargetSide",
+        "relativeSkewTargetQuoteType", "relativeSkewValue",
+    ]
+    j = await ctx.running_delta_slice(columns=need_cols)
+
+    j = j.with_columns([
+        pl.col("skewType").cast(pl.Int8, strict=False),
+        pl.col("relativeSkewTargetMkt").cast(pl.Utf8, strict=False),
+        pl.col("relativeSkewTargetSide").cast(pl.Utf8, strict=False),
+        pl.col("relativeSkewTargetQuoteType").cast(pl.Utf8, strict=False),
+        pl.col("relativeSkewValue").cast(pl.Float64, strict=False),
+    ])
+
+    for col in market_cols:
+        upd_df, clr_df = _build_impacted_updates_for_col(ctx, col, j)
+        if isinstance(upd_df, pl.DataFrame) and not upd_df.is_empty():
+            updates.append(upd_df)
+        if isinstance(clr_df, pl.DataFrame) and not clr_df.is_empty():
+            clears.append(clr_df)
+
+    pk = list(ctx.target_pks)
+    out = []
+
+    if clears:
+        clear_concat = pl.concat(clears, how="vertical_relaxed", rechunk=False) if len(clears) > 1 else clears[0]
+        clear_concat = clear_concat.unique(subset=pk, keep="last", maintain_order=True)
+        clear_concat.shrink_to_fit(in_place=True)
+        out.append(clear_concat)
+
+    if updates:
+        upd_concat = pl.concat(updates, how="vertical_relaxed", rechunk=False) if len(updates) > 1 else updates[0]
+        upd_concat = upd_concat.unique(subset=pk, keep="last", maintain_order=True)
+        upd_concat.shrink_to_fit(in_place=True)
+        out.append(upd_concat)
+
+    return out if out else None
+
+
+@rule(
+    name="clear_levels",
+    column_triggers_any=NEW_LEVEL_COLS,
+    depends_on_all=(RuleDependency("new_level_expand", DepMode.FINISHED),),
+    priority=Priority.CRITICAL,
+    emit_mode=EmitMode.IMMEDIATE,
+)
+async def clear_levels(ctx):
+    """When user deletes newLevel, clear other newLevels."""
+
+    df_delta = await ctx.ingress_delta_slice()
+
+    s = df_delta.hyper.schema()
+    pk_cols = list(ctx.target_pks)
+
+    touched_cols = [c for c in NEW_LEVEL_COLS if c in s]
+    clear_mask = pl.any_horizontal([pl.col(c).is_null() for c in touched_cols])
+    rows_to_clear = df_delta.filter(clear_mask).select(pk_cols)
+    if rows_to_clear.hyper.is_empty():
+        return None
+
+    clear_df = rows_to_clear.with_columns([
+        pl.lit(None, pl.Float64).alias("newLevel"),
+        pl.lit(None, pl.Float64).alias("newLevelPx"),
+        pl.lit(None, pl.Float64).alias("newLevelSpd"),
+        pl.lit(None, pl.Float64).alias("newLevelMmy"),
+        pl.lit(None, pl.Float64).alias("newLevelYld"),
+        pl.lit(None, pl.Float64).alias("newLevelDm"),
+    ])
+
+    return clear_df
+
+
+@rule(
+    name="desig_static_enhance",
+    column_triggers_all=("desigName",),
+    depends_on_all=(RuleDependency("fuzzy_name", DepMode.FINISHED),),
+    priority=Priority.MEDIUM,
+    emit_mode=EmitMode.IMMEDIATE,
+)
+async def desig_static_enhance(ctx):
+    """Update trader static information after fuzzy name match."""
+    data = await ctx.running_delta_slice(columns=[
+        'desigBook',
+        'desigRegion',
+        'desigRole',
+        'desigBusinessArea3',
+        'desigBusinessArea4',
+        'desigBusinessArea5',
+        'desigDesk',
+        'desigAsset',
+        'desigNickname',
+        'desigOrg',
+        'desigEmail',
+        'desigBrid',
+        'desigFirstName',
+        'desigLastName',
+        'desigTraderId',
+        'assignedTrader',
+        'algoAssigned',
+        'desigPosition',
+        'isDesigBsr',
+        'desigBsiSize',
+        'desigBsrSize',
+        'emRegion',
+        'regionBarclaysDesk',
+        'regionBarclaysRegion'
+    ])
+    print(data.to_dicts())
+
+
+
+@rule(
+    name="dv01_adjust_meta",
+    depends_on_all=(RuleDependency("dv01_adjust", DepMode.SUCCEEDED),),
+    room_pattern="*.PORTFOLIO",
+    target_grid_id="meta",
+    target_primary_keys=("portfolioKey", "date"),
+    priority=Priority.MEDIUM,
+    emit_mode=EmitMode.IMMEDIATE,
+)
+async def dv01_adjust_meta(ctx):
+    """Update meta grid with summarized DV01 after adjustment."""
+    from app.services.portfolio.meta import summarize_pt_for_meta
+    data = ctx.running_frame_slice.with_columns([
+        pl.col('grossSize').fill_null(0), pl.col('netSize').fill_null(0), pl.col('unitDv01').fill_null(0),
+    ])
+    m = await summarize_pt_for_meta(data)
+    key, date = ctx.portfolioKey, ctx.portfolioDate
+    d = Delta(
+        frame=m.with_columns(pl.lit(key, pl.String).alias('portfolioKey'), pl.lit(date,pl.Date).alias('date')),
+        pk_columns=["portfolioKey", "date"],
+        mode="update"
+    )
+    return Publish(
+        d, "update",
+        grid_id="meta",
+        room=f"{key.upper()}.META",
+        grid_filters={"column": "portfolioKey", "op": "eq", "value": key.lower()},
+        options={"persist": True, "broadcast": True, "trigger_rules": False, "relay": True},
+    )
+
+
+# --- Registration --------------------------------------------------------------
+
+
+def register_portfolio_rules(engine: RulesEngine):
+    """Register all portfolio rules with the rules engine."""
+
+    # Micro-grid rules
+    from app.services.rules.micro_grid_rules import register_micro_grid_rules
+    register_micro_grid_rules(engine)
+
+    # Meta Rules
+    engine.register(meta_update)               # Update pct priced to match
+    engine.register(test_in_name)              # if 'test' in client name, state -> TEST
+    engine.register(state_check)               # if state in TEST, etc. -> isReal to False
+    engine.register(rank_update)               # if won=1, cover=2, etc.
+
+    # Market Rules
+    # engine.register(clear_levels)              # When user deletes newLevel, clear other newLevels
+    engine.register(build_streaming_s3_rule()) # S3 conversions
+    engine.register(refresh_all_markets)       # Triggers market refresh
+    # engine.register(market_propegate)        # When ref markets updates -> update dependent skews
+    engine.register(new_level_expand)          # set newLevel when matching quote type is defined
+
+    # Trader Rules
+    engine.register(trader_claim)              # Trader claimed a bond
+    engine.register(fuzzy_desig)               # Match trader name input
+    engine.register(fuzzy_assigned)            # Match trader name input
+    engine.register(edit_audit)                # Record who made the edit
+    engine.register(removed_bond)              # Update for removal
+    # engine.register(desig_static_enhance)    # Update trader static
+
+    # Risk
+    engine.register(risk_adjust)               # When we adjust the size, adjust the dv01 as well
+    engine.register(dv01_adjust_meta)
+
