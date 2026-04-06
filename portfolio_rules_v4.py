@@ -73,6 +73,46 @@ ALL_MANUAL_COLS = tuple(
     for side in ("Bid", "Mid", "Ask")
 )
 
+# ---- wavg_levels constants ------------------------------------------------
+
+WAVG_SKEW_MARKETS = (
+    ("Bval", "bval"),
+    ("Macp", "macp"),
+    ("Markit", "markit"),
+    ("Idc", "idc"),
+)
+
+_skew_ref_cols: list[str] = []
+for _mkt_cap, _mkt_lower in WAVG_SKEW_MARKETS:
+    for _side in ("Bid", "Mid", "Ask"):
+        for _qt in ("Spd", "Px"):
+            _skew_ref_cols.append(f"{_mkt_lower}{_side}{_qt}")
+for _side in ("Bid", "Mid", "Ask"):
+    _skew_ref_cols.append(f"traceAdj{_side}Px")
+WAVG_SKEW_REF_COLS: Tuple[str, ...] = tuple(_skew_ref_cols)
+
+_wavg_base = ("newLevelSpd", "newLevelPx", "newLevelYld", "newLevelMmy",
+              "newLevelPxWidth", "newLevelSpdWidth")
+_wavg_bwic = tuple(f"bwic{c[0].upper()}{c[1:]}" for c in _wavg_base)
+_wavg_owic = tuple(f"owic{c[0].upper()}{c[1:]}" for c in _wavg_base)
+
+_wavg_skew_cols: list[str] = []
+for _mkt_cap, _ in WAVG_SKEW_MARKETS:
+    for _side in ("Bid", "Mid", "Ask"):
+        _wavg_skew_cols.append(f"skew{_mkt_cap}{_side}Spd")
+for _mkt_cap, _ in WAVG_SKEW_MARKETS:
+    for _side in ("Bid", "Mid", "Ask"):
+        _wavg_skew_cols.append(f"skew{_mkt_cap}{_side}Px")
+for _side in ("Bid", "Mid", "Ask"):
+    _wavg_skew_cols.append(f"skewTraceAdj{_side}Px")
+
+WAVG_ALL_OUTPUT_COLS: Tuple[str, ...] = _wavg_base + _wavg_bwic + _wavg_owic + tuple(_wavg_skew_cols)
+
+WAVG_TRIGGER_COLS: Tuple[str, ...] = (
+    "newLevelSpd", "newLevelPx", "newLevelYld", "newLevelMmy",
+    "grossDv01", "grossSize", "isReal", "side",
+) + WAVG_SKEW_REF_COLS
+
 # --------------------------------- Tiny helpers ---------------------------------------
 
 def build_streaming_s3_rule(
@@ -880,6 +920,163 @@ async def dv01_adjust_meta(ctx):
 
 
 # ---------------------------------------------------------------------------
+# wavg_levels helpers
+# ---------------------------------------------------------------------------
+
+def _wavg_level_exprs(prefix: str = "") -> list:
+    """Build wavg select expressions for the 4 level columns.
+    prefix="" → base names (newLevelSpd, ...).
+    prefix="bwic"/"owic" → bwicNewLevelSpd, ...
+    """
+    def _name(base: str) -> str:
+        return f"{prefix}{base[0].upper()}{base[1:]}" if prefix else base
+
+    return [
+        pl.col("newLevelSpd").hyper.wavg(pl.col("grossDv01")).alias(_name("newLevelSpd")),
+        pl.col("newLevelPx").hyper.wavg(pl.col("grossSize")).alias(_name("newLevelPx")),
+        pl.col("newLevelYld").hyper.wavg(pl.col("grossDv01")).alias(_name("newLevelYld")),
+        pl.col("newLevelMmy").hyper.wavg(pl.col("grossDv01")).alias(_name("newLevelMmy")),
+    ]
+
+
+def _skew_wavg_exprs() -> list:
+    """Build expressions for all skew wavg calculations.
+    skew = newLevel - refMarket, then wavg by appropriate weight.
+    Spd → grossDv01, Px → grossSize.
+    """
+    exprs: list = []
+    # Spd skews (weight by grossDv01)
+    for mkt_name, mkt_lower in WAVG_SKEW_MARKETS:
+        for side in ("Bid", "Mid", "Ask"):
+            exprs.append(
+                (pl.col("newLevelSpd") - pl.col(f"{mkt_lower}{side}Spd"))
+                .hyper.wavg(pl.col("grossDv01"))
+                .alias(f"skew{mkt_name}{side}Spd")
+            )
+    # Px skews (weight by grossSize)
+    for mkt_name, mkt_lower in WAVG_SKEW_MARKETS:
+        for side in ("Bid", "Mid", "Ask"):
+            exprs.append(
+                (pl.col("newLevelPx") - pl.col(f"{mkt_lower}{side}Px"))
+                .hyper.wavg(pl.col("grossSize"))
+                .alias(f"skew{mkt_name}{side}Px")
+            )
+    # TraceAdj Px skews (weight by grossSize)
+    for side in ("Bid", "Mid", "Ask"):
+        exprs.append(
+            (pl.col("newLevelPx") - pl.col(f"traceAdj{side}Px"))
+            .hyper.wavg(pl.col("grossSize"))
+            .alias(f"skewTraceAdj{side}Px")
+        )
+    return exprs
+
+
+# ---------------------------------------------------------------------------
+# Rule: wavg_levels  (cross-grid: PORTFOLIO -> META)
+# ---------------------------------------------------------------------------
+
+@rule(
+    name="wavg_levels",
+    room_pattern="*.PORTFOLIO",
+    target_grid_id="meta",
+    target_primary_keys=("portfolioKey", "date"),
+    column_triggers_any=WAVG_TRIGGER_COLS,
+    depends_on_all=(
+        RuleDependency("new_level_expand", DepMode.FINISHED),
+        RuleDependency("clear_levels", DepMode.FINISHED),
+        RuleDependency("s3_enrichment_stream", DepMode.FINISHED),
+    ),
+    priority=Priority.LOW,
+    emit_mode=EmitMode.END,
+    declared_column_outputs=WAVG_ALL_OUTPUT_COLS,
+)
+async def wavg_levels(ctx: RuleContext):
+    """Compute weighted-average levels from PORTFOLIO and emit to META grid."""
+    try:
+        await log.rules("[wavg_levels] START")
+
+        fetch_cols = [
+            "newLevelSpd", "newLevelPx", "newLevelYld", "newLevelMmy",
+            "grossDv01", "grossSize", "isReal", "side",
+            "portfolioKey", "rfqCreateDate",
+        ] + list(WAVG_SKEW_REF_COLS)
+
+        basket = await ctx.running_frame_slice(fetch_cols)
+        if basket.is_empty():
+            await log.rules("[wavg_levels] EXIT: basket empty")
+            return None
+
+        real = basket.filter(pl.col("isReal").cast(pl.Int8, strict=False) == 1)
+        if real.is_empty():
+            await log.rules("[wavg_levels] EXIT: no isReal=1 rows")
+            return None
+
+        key = basket.hyper.peek("portfolioKey")
+        date = basket.hyper.peek("rfqCreateDate")
+
+        # --- Base wavg levels (all isReal=1) ---
+        base_vals = real.select(_wavg_level_exprs()).row(0, named=True)
+
+        # --- BWIC = side "BUY" ---
+        bwic_df = real.filter(pl.col("side") == "BUY")
+        if not bwic_df.is_empty():
+            bwic_vals = bwic_df.select(_wavg_level_exprs("bwic")).row(0, named=True)
+        else:
+            bwic_vals = {f"bwic{c[0].upper()}{c[1:]}": None
+                         for c in ("newLevelSpd", "newLevelPx", "newLevelYld", "newLevelMmy")}
+
+        # --- OWIC = side "SELL" ---
+        owic_df = real.filter(pl.col("side") == "SELL")
+        if not owic_df.is_empty():
+            owic_vals = owic_df.select(_wavg_level_exprs("owic")).row(0, named=True)
+        else:
+            owic_vals = {f"owic{c[0].upper()}{c[1:]}": None
+                         for c in ("newLevelSpd", "newLevelPx", "newLevelYld", "newLevelMmy")}
+
+        # --- Widths = difference between OWIC and BWIC wavgs ---
+        bwic_px = bwic_vals.get("bwicNewLevelPx")
+        owic_px = owic_vals.get("owicNewLevelPx")
+        bwic_spd = bwic_vals.get("bwicNewLevelSpd")
+        owic_spd = owic_vals.get("owicNewLevelSpd")
+
+        px_width = (owic_px - bwic_px) if (owic_px is not None and bwic_px is not None) else None
+        spd_width = (bwic_spd - owic_spd) if (bwic_spd is not None and owic_spd is not None) else None
+
+        width_vals = {
+            "newLevelPxWidth": px_width,
+            "newLevelSpdWidth": spd_width,
+            "bwicNewLevelPxWidth": px_width,
+            "bwicNewLevelSpdWidth": spd_width,
+            "owicNewLevelPxWidth": px_width,
+            "owicNewLevelSpdWidth": spd_width,
+        }
+
+        # --- Skew wavg calculations ---
+        skew_vals = real.select(_skew_wavg_exprs()).row(0, named=True)
+
+        # --- Merge all results into a single meta row ---
+        result = {"portfolioKey": key, "date": date}
+        result.update(base_vals)
+        result.update(bwic_vals)
+        result.update(owic_vals)
+        result.update(width_vals)
+        result.update(skew_vals)
+
+        changed = tuple(k for k in result if k not in ("portfolioKey", "date"))
+        await log.rules(f"[wavg_levels] EMIT {len(changed)} cols to {key}.META")
+
+        return Delta(
+            frame=pl.DataFrame([result]),
+            pk_columns=("portfolioKey", "date"),
+            changed_columns=changed,
+            mode="update",
+        )
+    except Exception as e:
+        await log.error("wavg_levels error:", e=str(e))
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Rule 1: pct_priced_update  (cross-grid: PORTFOLIO -> META)
 # ---------------------------------------------------------------------------
 
@@ -1060,6 +1257,7 @@ def register_portfolio_rules(engine: RulesEngine):
 
     # Meta Rules
     engine.register(pct_priced_update)         # Cross-grid: pctPriced = non-null newLevel % among isReal=1
+    engine.register(wavg_levels)               # Cross-grid: wavg levels, bwic/owic, skews → META
     # engine.register(meta_update)             # (superseded by pct_priced_update)
     engine.register(test_in_name)              # if 'test' in client name, state -> TEST
     engine.register(state_check)               # if state in TEST, etc. -> isReal to False
