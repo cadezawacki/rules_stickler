@@ -923,6 +923,11 @@ async def dv01_adjust_meta(ctx):
 # wavg_levels helpers
 # ---------------------------------------------------------------------------
 
+def _f(col: str) -> pl.Expr:
+    """Cast a column to Float64 (strict=False) for safe arithmetic on string-typed grid data."""
+    return pl.col(col).cast(pl.Float64, strict=False)
+
+
 def _wavg_level_exprs(prefix: str = "") -> list:
     """Build wavg select expressions for the 4 level columns.
     prefix="" → base names (newLevelSpd, ...).
@@ -932,10 +937,10 @@ def _wavg_level_exprs(prefix: str = "") -> list:
         return f"{prefix}{base[0].upper()}{base[1:]}" if prefix else base
 
     return [
-        pl.col("newLevelSpd").hyper.wavg(pl.col("grossDv01")).alias(_name("newLevelSpd")),
-        pl.col("newLevelPx").hyper.wavg(pl.col("grossSize")).alias(_name("newLevelPx")),
-        pl.col("newLevelYld").hyper.wavg(pl.col("grossDv01")).alias(_name("newLevelYld")),
-        pl.col("newLevelMmy").hyper.wavg(pl.col("grossDv01")).alias(_name("newLevelMmy")),
+        _f("newLevelSpd").hyper.wavg(_f("grossDv01")).alias(_name("newLevelSpd")),
+        _f("newLevelPx").hyper.wavg(_f("grossSize")).alias(_name("newLevelPx")),
+        _f("newLevelYld").hyper.wavg(_f("grossDv01")).alias(_name("newLevelYld")),
+        _f("newLevelMmy").hyper.wavg(_f("grossDv01")).alias(_name("newLevelMmy")),
     ]
 
 
@@ -949,23 +954,23 @@ def _skew_wavg_exprs() -> list:
     for mkt_name, mkt_lower in WAVG_SKEW_MARKETS:
         for side in ("Bid", "Mid", "Ask"):
             exprs.append(
-                (pl.col("newLevelSpd") - pl.col(f"{mkt_lower}{side}Spd"))
-                .hyper.wavg(pl.col("grossDv01"))
+                (_f("newLevelSpd") - _f(f"{mkt_lower}{side}Spd"))
+                .hyper.wavg(_f("grossDv01"))
                 .alias(f"skew{mkt_name}{side}Spd")
             )
     # Px skews (weight by grossSize)
     for mkt_name, mkt_lower in WAVG_SKEW_MARKETS:
         for side in ("Bid", "Mid", "Ask"):
             exprs.append(
-                (pl.col("newLevelPx") - pl.col(f"{mkt_lower}{side}Px"))
-                .hyper.wavg(pl.col("grossSize"))
+                (_f("newLevelPx") - _f(f"{mkt_lower}{side}Px"))
+                .hyper.wavg(_f("grossSize"))
                 .alias(f"skew{mkt_name}{side}Px")
             )
     # TraceAdj Px skews (weight by grossSize)
     for side in ("Bid", "Mid", "Ask"):
         exprs.append(
-            (pl.col("newLevelPx") - pl.col(f"traceAdj{side}Px"))
-            .hyper.wavg(pl.col("grossSize"))
+            (_f("newLevelPx") - _f(f"traceAdj{side}Px"))
+            .hyper.wavg(_f("grossSize"))
             .alias(f"skewTraceAdj{side}Px")
         )
     return exprs
