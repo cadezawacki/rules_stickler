@@ -4,6 +4,7 @@
 from __future__ import annotations
 import asyncio
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional, Sequence, Dict, Tuple
 
 import polars as pl
@@ -49,6 +50,31 @@ QT_TO_NEWLEVEL: Dict[str, str] = {
 }
 
 CLEAR_RESETS_SKEW = True
+
+# ---- ref_level_expand constants ------------------------------------------------
+
+ACTIVE_QT_TO_SUFFIX: Dict[str, str] = {
+    "price": "Px",
+    "spread": "Spd",
+    "mmy": "Mmy",
+    "dm": "Dm",
+}
+
+CLIENT_QT_TO_SUFFIX: Dict[str, str] = {
+    "PX": "Px",
+    "SPD": "Spd",
+    "MMY": "Mmy",
+    "DM": "Dm",
+}
+
+REF_MARKET_WATERFALL = ("macp", "cbbt", "bval", "house")
+MANUAL_QT_SUFFIXES = ("Px", "Spd", "Mmy", "Dm")
+
+ALL_MANUAL_COLS = tuple(
+    f"manual{side}{qt}"
+    for qt in MANUAL_QT_SUFFIXES
+    for side in ("Bid", "Mid", "Ask")
+)
 
 # --------------------------------- Tiny helpers ---------------------------------------
 
@@ -751,6 +777,167 @@ async def dv01_adjust_meta(ctx):
     )
 
 
+# ---------------------------------------------------------------------------
+# Rule 1: pct_priced_update  (cross-grid: PORTFOLIO -> META)
+# ---------------------------------------------------------------------------
+
+@rule(
+    name="pct_priced_update",
+    room_pattern="*.PORTFOLIO",
+    target_grid_id="meta",
+    target_primary_keys=("portfolioKey", "date"),
+    column_triggers_any=("newLevel", "isReal"),
+    depends_on_all=(
+        RuleDependency("new_level_expand", DepMode.FINISHED),
+        RuleDependency("s3_enrichment_stream", DepMode.FINISHED),
+    ),
+    priority=Priority.LOW,
+    emit_mode=EmitMode.END,
+    declared_column_outputs=("pctPriced",),
+)
+async def pct_priced_update(ctx: RuleContext):
+    """Update pctPriced on meta grid: % of non-null newLevel among isReal=1 rows."""
+    try:
+        basket = await ctx.running_frame_slice(["newLevel", "isReal", "rfqCreateDate"])
+        if basket.is_empty():
+            return None
+
+        real_rows = basket.filter(pl.col("isReal").cast(pl.Int8, strict=False) == 1)
+        total = real_rows.height
+        if total == 0:
+            return None
+
+        priced = real_rows.filter(pl.col("newLevel").is_not_null()).height
+        pct = round(priced / total, 4)
+
+        key = basket.hyper.peek("portfolioKey")
+        date = basket.hyper.peek("rfqCreateDate")
+
+        return Delta(
+            frame=pl.DataFrame([{"portfolioKey": key, "date": date, "pctPriced": pct}]),
+            pk_columns=("portfolioKey", "date"),
+            changed_columns=("pctPriced",),
+            mode="update",
+        )
+    except Exception as e:
+        await log.error("pct_priced_update error:", e=str(e))
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Rule 2: ref_level_expand  (portfolio -> portfolio)
+# ---------------------------------------------------------------------------
+# Front-end contract: when editing refLevel, the client MUST also send
+# two companion columns in the same delta payload:
+#   - activeQuoteType : "client" | "price" | "spread" | "mmy" | "dm"
+#   - activeSide      : "Bid" | "Mid" | "Ask"
+# These reflect the page-level observables:
+#   page.activeQuoteType$.get('activeQuoteType')
+#   page.activeRefMarketSide.get('activeSide')
+# ---------------------------------------------------------------------------
+
+@rule(
+    name="ref_level_expand",
+    room_pattern="*.PORTFOLIO",
+    column_triggers_any=("refLevel",),
+    priority=Priority.HIGH,
+    emit_mode=EmitMode.IMMEDIATE,
+    declared_column_outputs=ALL_MANUAL_COLS + ("manualRefMktUser", "manualRefreshTime"),
+)
+async def ref_level_expand(ctx: RuleContext):
+    """Expand refLevel into manualBid/Mid/Ask columns for the active quote type,
+    inferring bid/ask width from reference markets when side is Mid."""
+    try:
+        # Build the list of reference-market columns we need for the waterfall
+        ref_cols = [
+            f"{mkt}{side}{qt}"
+            for mkt in REF_MARKET_WATERFALL
+            for side in ("Bid", "Ask")
+            for qt in MANUAL_QT_SUFFIXES
+        ]
+        extra = ["quoteType", "activeQuoteType", "activeSide"] + ref_cols
+
+        delta = await ctx.running_delta_slice(columns=extra)
+        if delta.is_empty():
+            return None
+
+        pk_cols = list(ctx.target_pks)
+        user_data = ctx.ingress_user
+        username = user_data.displayName if user_data else "UNKNOWN"
+        now_utc = datetime.now(timezone.utc)
+
+        rows = []
+        for row in delta.iter_rows(named=True):
+            ref_level = row.get("refLevel")
+            if ref_level is None:
+                continue
+            try:
+                ref_level = float(ref_level)
+            except (ValueError, TypeError):
+                continue
+
+            # --- resolve quote-type suffix ---
+            active_qt = str(row.get("activeQuoteType") or "").strip()
+            if active_qt.lower() == "client":
+                qt_raw = str(row.get("quoteType") or "").upper().strip()
+                suffix = CLIENT_QT_TO_SUFFIX.get(qt_raw)
+            else:
+                suffix = ACTIVE_QT_TO_SUFFIX.get(active_qt.lower())
+
+            if suffix is None:
+                continue  # unrecognised quote type — skip row
+
+            # --- resolve bid / mid / ask values ---
+            active_side = str(row.get("activeSide") or "").strip().capitalize()
+
+            bid_val = ref_level
+            mid_val = ref_level
+            ask_val = ref_level
+
+            if active_side == "Mid":
+                # Waterfall: macp -> cbbt -> bval -> house
+                for mkt in REF_MARKET_WATERFALL:
+                    mkt_ask = row.get(f"{mkt}Ask{suffix}")
+                    mkt_bid = row.get(f"{mkt}Bid{suffix}")
+                    if mkt_ask is not None and mkt_bid is not None:
+                        try:
+                            full_width = float(mkt_ask) - float(mkt_bid)
+                            if full_width >= 0:
+                                half = full_width / 2.0
+                                bid_val = ref_level - half
+                                mid_val = ref_level
+                                ask_val = ref_level + half
+                                break
+                        except (ValueError, TypeError):
+                            continue
+                # If no ref market found, bid = mid = ask = refLevel (already set)
+
+            # --- build output row ---
+            out_row = {pk: row[pk] for pk in pk_cols}
+
+            # Clear ALL manual columns first
+            for col in ALL_MANUAL_COLS:
+                out_row[col] = None
+
+            # Set the three columns for the active quote type
+            out_row[f"manualBid{suffix}"] = bid_val
+            out_row[f"manualMid{suffix}"] = mid_val
+            out_row[f"manualAsk{suffix}"] = ask_val
+
+            # Always stamp user + timestamp
+            out_row["manualRefMktUser"] = username
+            out_row["manualRefreshTime"] = now_utc
+
+            rows.append(out_row)
+
+        if rows:
+            return pl.DataFrame(rows)
+        return None
+    except Exception as e:
+        await log.error("ref_level_expand error:", e=str(e))
+        return None
+
+
 # --- Registration --------------------------------------------------------------
 
 
@@ -762,7 +949,8 @@ def register_portfolio_rules(engine: RulesEngine):
     register_micro_grid_rules(engine)
 
     # Meta Rules
-    engine.register(meta_update)               # Update pct priced to match
+    engine.register(pct_priced_update)         # Cross-grid: pctPriced = non-null newLevel % among isReal=1
+    # engine.register(meta_update)             # (superseded by pct_priced_update)
     engine.register(test_in_name)              # if 'test' in client name, state -> TEST
     engine.register(state_check)               # if state in TEST, etc. -> isReal to False
     engine.register(rank_update)               # if won=1, cover=2, etc.
@@ -773,6 +961,7 @@ def register_portfolio_rules(engine: RulesEngine):
     engine.register(refresh_all_markets)       # Triggers market refresh
     # engine.register(market_propegate)        # When ref markets updates -> update dependent skews
     engine.register(new_level_expand)          # set newLevel when matching quote type is defined
+    engine.register(ref_level_expand)          # Expand refLevel into manual bid/mid/ask columns
 
     # Trader Rules
     engine.register(trader_claim)              # Trader claimed a bond
