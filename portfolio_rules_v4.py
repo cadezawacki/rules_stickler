@@ -995,4 +995,3 @@ def register_portfolio_rules(engine: RulesEngine):
     # Risk
     engine.register(risk_adjust)               # When we adjust the size, adjust the dv01 as well
     engine.register(dv01_adjust_meta)
-
