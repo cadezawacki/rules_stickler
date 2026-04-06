@@ -789,6 +789,7 @@ async def dv01_adjust_meta(ctx):
     column_triggers_any=("newLevel", "isReal"),
     depends_on_all=(
         RuleDependency("new_level_expand", DepMode.FINISHED),
+        RuleDependency("clear_levels", DepMode.FINISHED),
         RuleDependency("s3_enrichment_stream", DepMode.FINISHED),
     ),
     priority=Priority.LOW,
@@ -956,7 +957,7 @@ def register_portfolio_rules(engine: RulesEngine):
     engine.register(rank_update)               # if won=1, cover=2, etc.
 
     # Market Rules
-    # engine.register(clear_levels)              # When user deletes newLevel, clear other newLevels
+    engine.register(clear_levels)                # When user deletes newLevel, clear other newLevels
     engine.register(build_streaming_s3_rule()) # S3 conversions
     engine.register(refresh_all_markets)       # Triggers market refresh
     # engine.register(market_propegate)        # When ref markets updates -> update dependent skews
