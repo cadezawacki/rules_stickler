@@ -97,7 +97,7 @@ def build_streaming_s3_rule(
         ),
         priority=Priority.HIGH,
         emit_mode=EmitMode.IMMEDIATE,
-        declared_column_outputs=NEW_LEVEL_COLS
+        declared_column_outputs=("newLevel",) + NEW_LEVEL_COLS
     )
     async def _s3_stream(ctx):
         await log.rules("[s3_enrichment] START")
@@ -159,6 +159,27 @@ def build_streaming_s3_rule(
                 ).otherwise(pl.col("newLevelSpd"))
                 .alias("newLevelSpd")
             ])
+
+        # Populate newLevel from the matching quoteType column in S3 output.
+        # This handles both paths: matching edits (new_level_expand already set it,
+        # S3 overwrites with converted value) and non-matching edits (nobody set
+        # newLevel yet, so we derive it from S3's converted matching column).
+        if "quoteType" not in out_df.columns:
+            out_df = out_df.join(df_delta.select(["tnum", "quoteType"]), on="tnum", how="left")
+
+        out_schema = out_df.hyper.schema()
+        nl_cols_present = [c for c in QT_TO_NEWLEVEL.values() if c in out_schema]
+        if nl_cols_present:
+            out_df = out_df.with_columns(
+                pl.coalesce([
+                    pl.when(pl.col("quoteType").cast(pl.String).str.to_uppercase() == pl.lit(qt))
+                    .then(pl.col(col).cast(pl.Float64, strict=False))
+                    .otherwise(pl.lit(None, pl.Float64))
+                    for qt, col in QT_TO_NEWLEVEL.items()
+                    if col in out_schema
+                ]).alias("newLevel")
+            )
+            await log.rules(f"[s3_enrichment] set newLevel from matching quoteType column")
 
         return out_df
 
