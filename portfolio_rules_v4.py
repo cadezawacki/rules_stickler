@@ -421,9 +421,19 @@ async def edit_audit(ctx):
 async def new_level_expand(ctx):
     """When user edits newLevelPx/Spd/Mmy/Dm AND that column matches the row's
     quoteType, set newLevel to that value and clear the other quote-type columns.
-    Null edits (deletions) are ignored — clear_levels handles those."""
+    Null edits (deletions) are ignored — clear_levels handles those.
+    Non-matching edits (user changed a column that doesn't match quoteType) are
+    left alone — we don't touch newLevel."""
     try:
         await log.rules("[new_level_expand] START")
+
+        # Which newLevel columns did the user ACTUALLY change?
+        user_changed = set(ctx.triggering_delta.columns) & set(NEW_LEVEL_COLS)
+        await log.rules(f"[new_level_expand] user actually changed: {user_changed}")
+        if not user_changed:
+            await log.rules("[new_level_expand] EXIT: no NEW_LEVEL_COLS in triggering delta")
+            return None
+
         all_mkts = list(NEW_LEVEL_COLS)
         delta = await ctx.running_delta_slice(columns=all_mkts + ["quoteType"])
         await log.rules(f"[new_level_expand] delta cols={delta.columns}, height={delta.height}")
@@ -437,8 +447,14 @@ async def new_level_expand(ctx):
             qt = str(row.get("quoteType") or "").upper().strip()
             matching_col = QT_TO_NEWLEVEL.get(qt)
             await log.rules(f"[new_level_expand] row quoteType={qt!r} -> matching_col={matching_col!r}")
+
             if matching_col is None or matching_col not in all_mkts:
                 await log.rules(f"[new_level_expand] SKIP: no matching col for quoteType={qt!r}")
+                continue
+
+            # Only act if the user actually edited the matching column
+            if matching_col not in user_changed:
+                await log.rules(f"[new_level_expand] SKIP: user edited {user_changed} but matching col is {matching_col!r} — non-matching edit")
                 continue
 
             val = row.get(matching_col)
