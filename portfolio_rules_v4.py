@@ -414,7 +414,7 @@ async def edit_audit(ctx):
     name="new_level_expand",
     column_triggers_any=NEW_LEVEL_COLS,
     room_pattern="*.PORTFOLIO",
-    priority=Priority.CRITICAL,
+    priority=Priority.HIGH,
     emit_mode=EmitMode.IMMEDIATE,
     declared_column_outputs=("newLevel",) + NEW_LEVEL_COLS,
 )
