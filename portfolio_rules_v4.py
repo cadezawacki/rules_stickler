@@ -1,6 +1,3 @@
-
-
-
 from __future__ import annotations
 import asyncio
 import re
@@ -104,7 +101,6 @@ def build_streaming_s3_rule(
         declared_column_outputs=NEW_LEVEL_COLS
     )
     async def _s3_stream(ctx):
-        return
         s3_cols = [
             "isin", "quoteType", "conventionQuoteType",
             "tradeToConvention", "settleDate", "tnum",
