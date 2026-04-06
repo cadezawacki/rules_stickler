@@ -100,19 +100,26 @@ def build_streaming_s3_rule(
         declared_column_outputs=NEW_LEVEL_COLS
     )
     async def _s3_stream(ctx):
+        await log.rules("[s3_enrichment] START")
         s3_cols = [
             "isin", "quoteType", "conventionQuoteType",
             "tradeToConvention", "settleDate", "tnum",
             "benchmarkIsin", "benchmarkBidYld", "benchmarkBidPx",
         ]
         df_delta = await ctx.running_delta_slice(columns=s3_cols)
-        if df_delta is None or df_delta.hyper.is_empty(): return
+        if df_delta is None or df_delta.hyper.is_empty():
+            await log.rules("[s3_enrichment] EXIT: delta is empty")
+            return
 
         portfolio_key = df_delta.hyper.peek("portfolioKey")
         market_cols = df_delta.hyper.cols_like("newLevel(Px|Spd|Yld|Mmy|Dm)$")
+        await log.rules(f"[s3_enrichment] market_cols found: {market_cols}")
 
-        if df_delta.filter([pl.col(tm).is_not_null() for tm in market_cols]).hyper.is_empty(): return
+        if df_delta.filter([pl.col(tm).is_not_null() for tm in market_cols]).hyper.is_empty():
+            await log.rules("[s3_enrichment] EXIT: all market cols are null after filter")
+            return
 
+        await log.rules(f"[s3_enrichment] calling S3 for portfolio={portfolio_key}, cols={market_cols}")
         from app.server import get_s3
         s3 = get_s3()
 
@@ -416,9 +423,12 @@ async def new_level_expand(ctx):
     quoteType, set newLevel to that value and clear the other quote-type columns.
     Null edits (deletions) are ignored — clear_levels handles those."""
     try:
+        await log.rules("[new_level_expand] START")
         all_mkts = list(NEW_LEVEL_COLS)
         delta = await ctx.running_delta_slice(columns=all_mkts + ["quoteType"])
+        await log.rules(f"[new_level_expand] delta cols={delta.columns}, height={delta.height}")
         if delta.is_empty():
+            await log.rules("[new_level_expand] EXIT: delta is empty")
             return None
 
         pk_cols = list(ctx.target_pks)
@@ -426,11 +436,15 @@ async def new_level_expand(ctx):
         for row in delta.iter_rows(named=True):
             qt = str(row.get("quoteType") or "").upper().strip()
             matching_col = QT_TO_NEWLEVEL.get(qt)
+            await log.rules(f"[new_level_expand] row quoteType={qt!r} -> matching_col={matching_col!r}")
             if matching_col is None or matching_col not in all_mkts:
+                await log.rules(f"[new_level_expand] SKIP: no matching col for quoteType={qt!r}")
                 continue
 
             val = row.get(matching_col)
+            await log.rules(f"[new_level_expand] {matching_col}={val!r}")
             if val is None:
+                await log.rules(f"[new_level_expand] SKIP: {matching_col} is null (deletion path)")
                 continue  # deletion — handled by clear_levels
 
             out_row = {pk: row[pk] for pk in pk_cols}
@@ -439,6 +453,7 @@ async def new_level_expand(ctx):
                 out_row[col] = val if col == matching_col else None
             rows.append(out_row)
 
+        await log.rules(f"[new_level_expand] produced {len(rows)} output rows")
         if rows:
             return pl.DataFrame(rows)
         return None
@@ -701,27 +716,31 @@ async def market_propegate(ctx):
 )
 async def clear_levels(ctx):
     """When user deletes newLevel (was non-null, now null), clear all newLevel columns."""
+    await log.rules("[clear_levels] START")
 
     df_delta = await ctx.ingress_delta_slice()
+    await log.rules(f"[clear_levels] ingress delta cols={df_delta.columns}, height={df_delta.height}")
 
     s = df_delta.hyper.schema()
     pk_cols = list(ctx.target_pks)
 
     touched_cols = [c for c in NEW_LEVEL_COLS if c in s]
+    await log.rules(f"[clear_levels] touched_cols={touched_cols}")
     if not touched_cols:
+        await log.rules("[clear_levels] EXIT: no NEW_LEVEL_COLS in delta schema")
         return None
 
-    # Compare against prior state: only clear when a column transitioned
-    # from non-null -> null (user explicitly deleted), not when it was
-    # never set in the first place.
     prior = await ctx.prior_delta_slice(columns=touched_cols)
+    await log.rules(f"[clear_levels] prior delta height={prior.height}")
     if prior.is_empty():
+        await log.rules("[clear_levels] EXIT: prior delta is empty")
         return None
 
     joined = df_delta.select(pk_cols + touched_cols).join(
         prior.select(pk_cols + touched_cols),
         on=pk_cols, how="inner", suffix="_prior",
     )
+    await log.rules(f"[clear_levels] joined height={joined.height}, cols={joined.columns}")
 
     # A column was deleted if it is null NOW and was non-null BEFORE
     delete_exprs = [
@@ -730,9 +749,12 @@ async def clear_levels(ctx):
     ]
     clear_mask = pl.any_horizontal(delete_exprs)
     rows_to_clear = joined.filter(clear_mask).select(pk_cols)
+    await log.rules(f"[clear_levels] rows_to_clear={rows_to_clear.height}")
     if rows_to_clear.hyper.is_empty():
+        await log.rules("[clear_levels] EXIT: no rows transitioned non-null -> null")
         return None
 
+    await log.rules(f"[clear_levels] CLEARING {rows_to_clear.height} rows")
     clear_df = rows_to_clear.with_columns([
         pl.lit(None, pl.Float64).alias("newLevel"),
         pl.lit(None, pl.Float64).alias("newLevelPx"),
@@ -837,20 +859,27 @@ async def dv01_adjust_meta(ctx):
 async def pct_priced_update(ctx: RuleContext):
     """Update pctPriced on meta grid: % of non-null newLevel among isReal=1 rows."""
     try:
+        await log.rules("[pct_priced_update] START")
         basket = await ctx.running_frame_slice(["newLevel", "isReal", "rfqCreateDate"])
+        await log.rules(f"[pct_priced_update] basket height={basket.height}")
         if basket.is_empty():
+            await log.rules("[pct_priced_update] EXIT: basket is empty")
             return None
 
         real_rows = basket.filter(pl.col("isReal").cast(pl.Int8, strict=False) == 1)
         total = real_rows.height
+        await log.rules(f"[pct_priced_update] isReal=1 rows: {total}")
         if total == 0:
+            await log.rules("[pct_priced_update] EXIT: no isReal=1 rows")
             return None
 
         priced = real_rows.filter(pl.col("newLevel").is_not_null()).height
         pct = round(priced / total, 4)
+        await log.rules(f"[pct_priced_update] priced={priced}/{total} = {pct}")
 
         key = basket.hyper.peek("portfolioKey")
         date = basket.hyper.peek("rfqCreateDate")
+        await log.rules(f"[pct_priced_update] EMIT pctPriced={pct} to {key}.META")
 
         return Delta(
             frame=pl.DataFrame([{"portfolioKey": key, "date": date, "pctPriced": pct}]),
