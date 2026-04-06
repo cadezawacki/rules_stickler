@@ -2858,6 +2858,13 @@ class RulesEngine:
                     tgt_pks = r.target_primary_keys or primary_keys or actor_context.primary_keys
                     tgt_grid = r.target_grid_id or room_to_grid_id(room)
 
+                    # Resolve glob target rooms against the source room.
+                    # e.g. source "KEY.PORTFOLIO", target "*.META" → "KEY.META"
+                    if tgt and "*" in tgt:
+                        src_prefix = room.rsplit(".", 1)[0]
+                        tgt_suffix = tgt.rsplit(".", 1)[-1]
+                        tgt = f"{src_prefix}.{tgt_suffix}"
+
                     if not tgt_pks:
                         tgt_pks = await query_primary_keys(tgt_grid)
 
