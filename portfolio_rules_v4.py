@@ -94,7 +94,6 @@ def build_streaming_s3_rule(
         ],
         depends_on_all=(
             RuleDependency("new_level_expand", DepMode.FINISHED),
-            RuleDependency("clear_levels", DepMode.FINISHED),
         ),
         priority=Priority.HIGH,
         emit_mode=EmitMode.IMMEDIATE,
@@ -825,7 +824,7 @@ async def dv01_adjust_meta(ctx):
     room_pattern="*.PORTFOLIO",
     target_grid_id="meta",
     target_primary_keys=("portfolioKey", "date"),
-    column_triggers_any=("newLevel", "isReal"),
+    column_triggers_any=("newLevel", "isReal") + NEW_LEVEL_COLS,
     depends_on_all=(
         RuleDependency("new_level_expand", DepMode.FINISHED),
         RuleDependency("clear_levels", DepMode.FINISHED),
