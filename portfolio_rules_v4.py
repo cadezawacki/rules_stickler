@@ -95,6 +95,10 @@ def build_streaming_s3_rule(
             "benchmarkBidYld",
             "benchmarkBidPx",
         ],
+        depends_on_all=(
+            RuleDependency("new_level_expand", DepMode.FINISHED),
+            RuleDependency("clear_levels", DepMode.FINISHED),
+        ),
         priority=Priority.HIGH,
         emit_mode=EmitMode.IMMEDIATE,
         declared_column_outputs=NEW_LEVEL_COLS
@@ -335,8 +339,7 @@ async def risk_adjust(ctx):
     column_triggers_any=tuple(NEW_LEVEL_COLS) + SKEW_COLS,
     depends_on_all=(
             RuleDependency("new_level_expand", DepMode.FINISHED),
-            # RuleDependency("clear_levels", DepMode.FINISHED),
-            # RuleDependency("s3_enrichment_stream", DepMode.FINISHED),
+            RuleDependency("clear_levels", DepMode.FINISHED),
     ),
     room_pattern="*.PORTFOLIO",
     priority=Priority.AUDIT,
@@ -408,27 +411,44 @@ async def edit_audit(ctx):
 @rule(
     name="new_level_expand",
     column_triggers_any=NEW_LEVEL_COLS,
-    depends_on_all=(RuleDependency("s3_enrichment_stream", DepMode.FINISHED),),
+    room_pattern="*.PORTFOLIO",
     priority=Priority.CRITICAL,
     emit_mode=EmitMode.IMMEDIATE,
+    declared_column_outputs=("newLevel",) + NEW_LEVEL_COLS,
 )
 async def new_level_expand(ctx):
+    """When user edits newLevelPx/Spd/Mmy/Dm AND that column matches the row's
+    quoteType, set newLevel to that value and clear the other quote-type columns.
+    Null edits (deletions) are ignored — clear_levels handles those."""
     try:
-        all_mkts = ["newLevelPx", "newLevelSpd", "newLevelYld", "newLevelMmy", "newLevelDm"]
-        changes = (await ctx.running_delta_slice(columns=(all_mkts + ["quoteType", "newLevel"]))).with_columns(
-            pl.col("quoteType").replace_strict(QT_TO_NEWLEVEL, return_dtype=pl.String).alias("_qtMap"),
-            pl.col("newLevel").alias("_newLevel"),
-        )
-        c = list(set(ensure_list(ctx.target_pks) + ["newLevel"]))
-        result = changes.with_columns([
-            pl.coalesce([
-                pl.when(pl.col("_qtMap") == col).then(pl.col(col)).otherwise(pl.lit(None, pl.Float64))
-                for col in all_mkts
-            ]).alias("newLevel")
-        ])
-        return result.select(c)
+        all_mkts = list(NEW_LEVEL_COLS)
+        delta = await ctx.running_delta_slice(columns=all_mkts + ["quoteType"])
+        if delta.is_empty():
+            return None
+
+        pk_cols = list(ctx.target_pks)
+        rows = []
+        for row in delta.iter_rows(named=True):
+            qt = str(row.get("quoteType") or "").upper().strip()
+            matching_col = QT_TO_NEWLEVEL.get(qt)
+            if matching_col is None or matching_col not in all_mkts:
+                continue
+
+            val = row.get(matching_col)
+            if val is None:
+                continue  # deletion — handled by clear_levels
+
+            out_row = {pk: row[pk] for pk in pk_cols}
+            out_row["newLevel"] = val
+            for col in all_mkts:
+                out_row[col] = val if col == matching_col else None
+            rows.append(out_row)
+
+        if rows:
+            return pl.DataFrame(rows)
+        return None
     except Exception as e:
-        await log.error("New level expand:", e=str(e))
+        await log.error("new_level_expand error:", e=str(e))
         return None
 
 
@@ -677,9 +697,12 @@ async def market_propegate(ctx):
 @rule(
     name="clear_levels",
     column_triggers_any=NEW_LEVEL_COLS,
+    room_pattern="*.PORTFOLIO",
     depends_on_all=(RuleDependency("new_level_expand", DepMode.FINISHED),),
     priority=Priority.CRITICAL,
     emit_mode=EmitMode.IMMEDIATE,
+    suppress_cascade=True,
+    declared_column_outputs=("newLevel",) + NEW_LEVEL_COLS,
 )
 async def clear_levels(ctx):
     """When user deletes newLevel (was non-null, now null), clear all newLevel columns."""
