@@ -125,7 +125,9 @@ def build_streaming_s3_rule(
 
         all_payloads = []
         payloads = await s3.pt_to_s3_payloads(df_delta, market_cols=market_cols, contextFields=["tnum"])
-        if not payloads: return
+        if not payloads:
+            await log.rules("[s3_enrichment] EXIT: no payloads")
+            return
 
         s3_chunk = await s3.stream_query_retry_failed(
             payloads,
@@ -137,7 +139,9 @@ def build_streaming_s3_rule(
             raw=False,
             stream=False,
         )
-        if s3_chunk is None or s3_chunk.hyper.is_empty(): return
+        if s3_chunk is None or s3_chunk.hyper.is_empty():
+            await log.rules("[s3_enrichment] EXIT: s3_chunk is empty/null")
+            return
 
         out_df = s3_chunk.with_columns([
             pl.col("s3Context").cast(pl.String, strict=False).alias("tnum"),
@@ -181,6 +185,7 @@ def build_streaming_s3_rule(
             )
             await log.rules(f"[s3_enrichment] set newLevel from matching quoteType column")
 
+        await log.rules(f"[s3_enrichment] RETURNING out_df: cols={out_df.columns}, height={out_df.height}")
         return out_df
 
     return _s3_stream
