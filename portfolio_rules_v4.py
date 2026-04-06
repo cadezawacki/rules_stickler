@@ -682,7 +682,7 @@ async def market_propegate(ctx):
     emit_mode=EmitMode.IMMEDIATE,
 )
 async def clear_levels(ctx):
-    """When user deletes newLevel, clear other newLevels."""
+    """When user deletes newLevel (was non-null, now null), clear all newLevel columns."""
 
     df_delta = await ctx.ingress_delta_slice()
 
@@ -690,8 +690,28 @@ async def clear_levels(ctx):
     pk_cols = list(ctx.target_pks)
 
     touched_cols = [c for c in NEW_LEVEL_COLS if c in s]
-    clear_mask = pl.any_horizontal([pl.col(c).is_null() for c in touched_cols])
-    rows_to_clear = df_delta.filter(clear_mask).select(pk_cols)
+    if not touched_cols:
+        return None
+
+    # Compare against prior state: only clear when a column transitioned
+    # from non-null -> null (user explicitly deleted), not when it was
+    # never set in the first place.
+    prior = await ctx.prior_delta_slice(columns=touched_cols)
+    if prior.is_empty():
+        return None
+
+    joined = df_delta.select(pk_cols + touched_cols).join(
+        prior.select(pk_cols + touched_cols),
+        on=pk_cols, how="inner", suffix="_prior",
+    )
+
+    # A column was deleted if it is null NOW and was non-null BEFORE
+    delete_exprs = [
+        (pl.col(c).is_null() & pl.col(f"{c}_prior").is_not_null())
+        for c in touched_cols
+    ]
+    clear_mask = pl.any_horizontal(delete_exprs)
+    rows_to_clear = joined.filter(clear_mask).select(pk_cols)
     if rows_to_clear.hyper.is_empty():
         return None
 
